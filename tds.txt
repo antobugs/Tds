@@ -1,0 +1,510 @@
+--[[ Cameraman TD — Auto Win Trade v2 (real remote signatures)
+     Flow: scan server -> request -> add units -> score -> Accept -> Confirm ]]
+
+if getgenv().CTD_AWT_LOADED then pcall(function() getgenv().CTD_AWT:Destroy() end) end
+getgenv().CTD_AWT_LOADED = true
+
+local CONFIG = {
+    minWinPct      = 0.10,
+    minWinAbs      = 50,
+    minTheirValue  = 100,
+    targetOffer    = 1500,   -- value to put on our side
+    maxOfferValue  = 4000,
+    autoPipeline   = false,
+    requireGem     = false,
+    autoDecline    = true,
+    declineLossPct = 0.35,
+    acceptDelay    = 1.5,
+    confirmDelay   = 1.2,
+    sendCooldown   = 10,
+    openTimeout    = 12,
+    tradeTimeout   = 45,
+    slotStart      = 1,
+    acceptSlot     = 2,
+    chatLine       = "auto trade, offering good value",
+    useGroq        = false,
+    groqKey        = "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",
+    groqModel      = "llama-3.3-70b-versatile",
+    ocValue        = 0,
+    valueUrl       = "https://cameraman-td.vaultedvaluesx.com/value-list",
+}
+
+local Players, RS = game:GetService("Players"), game:GetService("ReplicatedStorage")
+local LP = Players.LocalPlayer
+local NET = RS:WaitForChild("ModuleLoader"):WaitForChild("Shared"):WaitForChild("Network")
+local EV, RF, REP = NET:WaitForChild("RemoteEvent"), NET:WaitForChild("RemoteFunction"), RS:WaitForChild("RemoteEvents")
+
+local function ev(n) return EV:WaitForChild(n, 20) end
+local function rf(n) return RF:WaitForChild(n, 20) end
+
+local R = {
+    send     = ev("TradeSendRequest"),
+    add      = rf("TradeAddItem"),
+    remove   = rf("TradeRemoveItem"),
+    accept   = ev("TradeAccept"),
+    decline  = ev("TradeDecline"),
+    declineR = ev("TradeDeclineRequest"),
+    state    = ev("TradeState"),
+    chat     = ev("TradeChat"),
+    plaza    = ev("JoinTradingPlaza"),
+}
+
+local function log(...) print("[CTD]", ...) end
+
+-- ================= VALUES =================
+local DB, DBReady = {}, false
+local function norm(s) return (tostring(s):lower():gsub("[%s%-_]+", " "):gsub("^%s+", ""):gsub("%s+$", "")) end
+local function isGem(n) local l = tostring(n):lower() return l:find("gem", 1, true) ~= nil end
+
+local function fetch(url, post, headers)
+    local req = (syn and syn.request) or (http and http.request) or http_request or request
+    if req then
+        local ok, res = pcall(req, { Url = url, Method = post and "POST" or "GET", Body = post,
+            Headers = headers or { ["User-Agent"] = "Mozilla/5.0" } })
+        if ok and res then return res.Body or res.body end
+    end
+    if not post then local ok, b = pcall(game.HttpGet, game, url, true) return ok and b or nil end
+end
+
+local function parseItems(html)
+    local body = html:gsub('\\"', '"'):gsub("\\\\/", "/")
+    local out, pos = {}, 1
+    while true do
+        local s = body:find('{"id":"', pos, true); if not s then break end
+        local nxt = body:find('{"id":"', s + 1, true) or (#body + 1)
+        local c = body:sub(s, nxt); pos = nxt
+        if c:find('"displayFields"', 1, true) then
+            local name = c:match('"name":"(.-)"')
+            local rawv = c:match('"label":"Value","value":(%b{})')
+                      or c:match('"label":"Value","value":"(.-)"')
+                      or c:match('"label":"Value","value":([%d%.]+)')
+            if name and rawv then
+                local val
+                if rawv:sub(1,1) == "{" then
+                    local lo, hi = rawv:match('"low":(%d+),"high":(%d+)')
+                    if lo then val = (tonumber(lo)+tonumber(hi))/2 end
+                else val = tonumber(rawv) end
+                local k = norm(name)
+                if k ~= "" then out[k] = { name = name, value = val or CONFIG.ocValue, gem = isGem(name) } end
+            end
+        end
+    end
+    return out
+end
+
+local function loadValues()
+    local b = fetch(CONFIG.valueUrl)
+    if not b then log("value fetch failed") return false end
+    local p = parseItems(b); local n = 0; for _ in pairs(p) do n = n + 1 end
+    if n < 20 then log("parse only " .. n) return false end
+    DB, DBReady = p, true
+    log("values loaded: " .. n)
+    return true
+end
+
+local function valueOf(name)
+    local m = MAP[norm(name)]
+    local e = DB[norm(m or name)]
+    return e and e.value or 0, e
+end
+
+-- ================= INVENTORY / REPLICA =================
+local Profiles, UUIDIndex = {}, {}
+local function deepCollect(v, out, d)
+    d = d or 0
+    if d > 7 or type(v) ~= "table" then return out end
+    local uuid, nm, cat
+    for k, x in pairs(v) do
+        if type(x) == "string" then
+            if x:match("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-") then uuid = x end
+            local lk = tostring(k):lower()
+            if lk == "name" or lk == "itemname" or lk == "item" then nm = x end
+            if lk == "category" or lk == "type" or lk == "class" then cat = x end
+        end
+    end
+    if uuid and nm then
+        UUIDIndex[uuid] = nm
+        if DB[norm(nm)] then out[#out+1] = { uuid = uuid, name = nm, cat = cat or "Tower", value = valueOf(nm) } end
+    end
+    for _, x in pairs(v) do if type(x) == "table" then deepCollect(x, out, d+1) end end
+    return out
+end
+
+local function inventory()
+    local l = {}
+    for _, p in pairs(Profiles) do deepCollect(p, l) end
+    table.sort(l, function(a, b) return a.value < b.value end)
+    return l
+end
+
+task.spawn(function()
+    local c = REP:FindFirstChild("ReplicaCreate")
+    if c then c.OnClientEvent:Connect(function(_, d) if type(d) == "table" then Profiles[#Profiles+1] = d end end) end
+end)
+
+-- ================= GROQ NAME MAPPING =================
+local MAP = {}
+local function groqMap()
+    if not CONFIG.useGroq or not DBReady then return end
+    local inv, seen, invNames = inventory(), {}, {}
+    for _, it in ipairs(inv) do
+        if not seen[it.name] then seen[it.name] = true; invNames[#invNames+1] = it.name end
+    end
+    if #invNames == 0 then log("groq: empty inventory") return end
+    local listNames = {}
+    for _, e in pairs(DB) do listNames[#listNames+1] = e.name end
+    local prompt = table.concat({
+        "Match each inventory item to the closest value-list item. Return JSON only: {\"invName\":\"listName\"}.",
+        "INVENTORY: " .. table.concat(invNames, " | "),
+        "LIST: " .. table.concat(listNames, " | "),
+    }, "\n")
+    local body = game:GetService("HttpService"):JSONEncode({
+        model = CONFIG.groqModel,
+        temperature = 0,
+        response_format = { type = "json_object" },
+        messages = { { role = "user", content = prompt } },
+    })
+    local res = fetch("https://api.groq.com/openai/v1/chat/completions", body, {
+        ["Content-Type"] = "application/json",
+        ["Authorization"] = "Bearer " .. CONFIG.groqKey,
+    })
+    if not res then log("groq failed") return end
+    local ok, data = pcall(game.GetService(game, "HttpService").JSONDecode, game:GetService("HttpService"), res)
+    if not ok or not data or not data.choices then log("groq decode failed") return end
+    local ok2, m = pcall(game:GetService("HttpService").JSONDecode, game:GetService("HttpService"), data.choices[1].message.content)
+    if ok2 and type(m) == "table" then
+        local n = 0
+        for k, v in pairs(m) do if DB[norm(v)] then MAP[norm(k)] = v; n = n + 1 end end
+        log("groq mapped " .. n .. " names")
+    end
+end
+
+-- ================= TRADE STATE =================
+local S = { tradeId = nil, our = {}, their = {}, ourUuids = {}, open = false, slot = 0, t0 = 0, lastAccept = 0 }
+
+local function resetTrade()
+    S.tradeId, S.our, S.their, S.ourUuids, S.open, S.slot, S.t0 = nil, {}, {}, {}, false, 0, os.clock()
+end
+
+local function bump(t, n, d) local k = norm(n) t[k] = math.max(0, (t[k] or 0) + d); if t[k] == 0 then t[k] = nil end end
+
+local function deepStrings(v, out, d)
+    d = d or 0
+    if d > 8 then return out end
+    if type(v) == "string" then out[#out+1] = v
+    elseif type(v) == "table" then
+        for k, x in pairs(v) do
+            if type(k) == "string" then out[#out+1] = k end
+            deepStrings(x, out, d+1)
+        end
+    end
+    return out
+end
+
+local function score(counts)
+    local t, items = 0, {}
+    for k, n in pairs(counts) do
+        local e = DB[k]
+        if e then t = t + e.value*n; items[#items+1] = { name = e.name, value = e.value, qty = n, gem = e.gem } end
+    end
+    table.sort(items, function(a, b) return a.value > b.value end)
+    return t, items
+end
+
+S.state.OnClientEvent:Connect(function(...)
+    local args = { ... }
+    local flat = table.concat(deepStrings(args, {}), " "):lower()
+
+    local tid = flat:match("(%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x)")
+    if tid then S.tradeId = tid end
+
+    local theirs = {}
+    for _, s in ipairs(deepStrings(args, {})) do
+        local nm = DB[norm(s)] and s or UUIDIndex[s]
+        if nm and DB[norm(nm)] then
+            if S.ourUuids[s] or (S.our[norm(nm)] or 0) > 0 then
+                if not S.ourUuids[s] then bump(S.our, nm, -1) end
+            else
+                theirs[norm(nm)] = (theirs[norm(nm)] or 0) + 1
+            end
+        end
+    end
+    S.their = theirs
+
+    if flat:find("cancel") or flat:find("declin") or flat:find("end") then S.open = false
+    elseif flat:find("trade") or tid then S.open = true end
+
+    onChange:Fire()
+end)
+
+local function evaluate()
+    local tv, ti = score(S.their)
+    local ov, oi = score(S.our)
+    local d = tv - ov
+    local gem = false
+    for _, it in ipairs(ti) do if it.gem then gem = true break end end
+    return { their = tv, our = ov, delta = d, pct = ov > 0 and d/ov or (d > 0 and 999 or 0),
+             tItems = ti, oItems = oi, gem = gem }
+end
+
+local function profitable(r)
+    if r.their < CONFIG.minTheirValue then return false end
+    if CONFIG.requireGem and not r.gem then return false end
+    if r.our == 0 and r.their > 0 then return true end
+    return r.delta >= CONFIG.minWinAbs or r.pct >= CONFIG.minWinPct
+end
+
+-- our add calls are authoritative
+local function addItem(uuid, cat)
+    if not S.tradeId then return false end
+    S.slot = S.slot + 1
+    local ok = pcall(function() R.add:InvokeServer(S.tradeId, CONFIG.slotStart + S.slot - 1, uuid, cat) end)
+    if ok then
+        local nm = UUIDIndex[uuid]
+        S.ourUuids[uuid] = nm
+        if nm then bump(S.our, nm, 1) end
+        onChange:Fire()
+    end
+    return ok
+end
+
+local function removeItem(uuid, cat)
+    if not S.tradeId then return end
+    S.slot = math.max(0, S.slot - 1)
+    pcall(function() R.remove:InvokeServer(S.tradeId, CONFIG.slotStart + S.slot, uuid, cat) end)
+    local nm = UUIDIndex[uuid]
+    S.ourUuids[uuid] = nil
+    if nm then bump(S.our, nm, -1) end
+    onChange:Fire()
+end
+
+local function doAccept()
+    if not S.tradeId or os.clock() - S.lastAccept < 3 then return end
+    S.lastAccept = os.clock()
+    log("ACCEPT " .. S.tradeId)
+    pcall(function() R.accept:FireServer(S.tradeId, CONFIG.acceptSlot, "Accept") end)
+    task.delay(CONFIG.confirmDelay, function()
+        pcall(function() R.accept:FireServer(S.tradeId, CONFIG.acceptSlot, "Confirm") end)
+        log("CONFIRM")
+    end)
+end
+
+local function doDecline()
+    if not S.tradeId then return end
+    pcall(function() R.decline:FireServer(S.tradeId, CONFIG.acceptSlot, "Decline") end)
+    task.delay(0.2, function() pcall(function() R.decline:FireServer(S.tradeId, CONFIG.acceptSlot) end) end)
+    log("DECLINE")
+end
+
+local onChange = Instance.new("BindableEvent")
+
+-- ================= PIPELINE =================
+local busy, blacklist, lastSend = false, {}, 0
+
+local function sendTrade(plr)
+    if busy or not plr then return end
+    busy = true
+    resetTrade()
+    log("request -> " .. plr.Name)
+    pcall(function() R.send:FireServer(plr) end)
+
+    local t = os.clock()
+    while os.clock() - t < CONFIG.openTimeout and not (S.open and S.tradeId) do task.wait(0.2) end
+    if not (S.open and S.tradeId) then
+        blacklist[plr] = true; busy = false
+        log("no window, blacklisted " .. plr.Name)
+        return
+    end
+    log("window open " .. S.tradeId)
+
+    if CONFIG.chatLine ~= "" then
+        task.delay(1, function() pcall(function() R.chat:FireServer(S.tradeId, CONFIG.chatLine) end) end)
+    end
+
+    -- build our side
+    local inv, spent = inventory(), 0
+    for _, it in ipairs(inv) do
+        if spent >= math.min(CONFIG.targetOffer, CONFIG.maxOfferValue) then break end
+        if not it.gem or spent < CONFIG.targetOffer * 0.6 then
+            addItem(it.uuid, it.cat)
+            spent = spent + it.value
+            task.wait(0.25)
+        end
+    end
+    log("offered " .. spent)
+
+    -- wait for them / decide
+    local t2 = os.clock()
+    while os.clock() - t2 < CONFIG.tradeTimeout do
+        task.wait(0.4)
+        if not S.open then break end
+        local r = evaluate()
+        if profitable(r) then doAccept(); break end
+        if CONFIG.autoDecline and r.our > 0 and r.pct < -CONFIG.declineLossPct then doDecline(); break end
+    end
+    task.wait(2)
+    busy = false
+end
+
+local function targets()
+    local out = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LP and not blacklist[p] then
+            local ok, dist = true, 9999
+            if LP.Character and p.Character and LP.Character:FindFirstChild("HumanoidRootPart") and p.Character:FindFirstChild("HumanoidRootPart") then
+                dist = (LP.Character.HumanoidRootPart.Position - p.Character.HumanoidRootPart.Position).Magnitude
+            end
+            out[#out+1] = { plr = p, dist = dist }
+        end
+    end
+    table.sort(out, function(a, b) return a.dist < b.dist end)
+    return out
+end
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if CONFIG.autoPipeline and not busy and os.clock() - lastSend > CONFIG.sendCooldown then
+            local list = targets()
+            if #list > 0 then lastSend = os.clock(); sendTrade(list[1].plr) end
+        end
+    end
+end)
+
+-- ================= GUI =================
+local gui = Instance.new("ScreenGui")
+gui.Name, gui.ResetOnSpawn = "CTD_AWT", false
+gui.Parent = (gethui and gethui()) or LP:WaitForChild("PlayerGui")
+getgenv().CTD_AWT = gui
+
+local win = Instance.new("Frame")
+win.Size, win.Position = UDim2.fromOffset(360, 470), UDim2.fromOffset(24, 80)
+win.BackgroundColor3, win.BorderSizePixel, win.Active, win.Draggable = Color3.fromRGB(14,15,20), 0, true, true
+win.Parent = gui
+Instance.new("UICorner", win).CornerRadius = UDim.new(0, 10)
+local st = Instance.new("UIStroke", win); st.Color = Color3.fromRGB(48,52,66)
+
+local function lbl(t, y, c, s, b)
+    local l = Instance.new("TextLabel")
+    l.Size, l.Position, l.BackgroundTransparency = UDim2.new(1,-20,0,s or 16), UDim2.fromOffset(10,y), 1
+    l.Font = b and Enum.Font.GothamBold or Enum.Font.Gotham
+    l.TextSize, l.TextColor3, l.TextXAlignment, l.Text = s or 13, c or Color3.fromRGB(200,204,214), Enum.TextXAlignment.Left, t
+    l.Parent = win
+    return l
+end
+
+lbl("CTD AUTO WIN TRADE", 8, Color3.fromRGB(255,255,255), 15, true)
+local status = lbl("idle", 27, Color3.fromRGB(140,145,160), 11)
+local theirsL = lbl("THEY: 0", 46, Color3.fromRGB(90,199,122), 13, true)
+local oursL   = lbl("YOU : 0", 64, Color3.fromRGB(242,85,90), 13, true)
+local deltaL  = lbl("DELTA: 0", 82, Color3.fromRGB(255,255,255), 15, true)
+local gemL    = lbl("gem: -", 103, Color3.fromRGB(140,145,160), 11)
+
+local function scroll(y, h)
+    local f = Instance.new("ScrollingFrame")
+    f.Size, f.Position = UDim2.new(1,-20,0,h), UDim2.fromOffset(10,y)
+    f.BackgroundColor3, f.BorderSizePixel, f.ScrollBarThickness = Color3.fromRGB(19,21,29), 0, 4
+    f.CanvasSize, f.AutomaticCanvasSize = UDim2.new(), Enum.AutomaticSize.Y
+    f.Parent = win
+    Instance.new("UICorner", f).CornerRadius = UDim.new(0,6)
+    local l = Instance.new("UIListLayout", f); l.Padding = UDim.new(0,1)
+    return f
+end
+
+local itemList = scroll(122, 110)
+local playerList = scroll(266, 96)
+
+local function toggle(name, key, x, y)
+    local b = Instance.new("TextButton")
+    b.Size, b.Position = UDim2.new(0.5,-14,0,24), UDim2.fromOffset(x,y)
+    b.BackgroundColor3 = CONFIG[name] and Color3.fromRGB(46,110,74) or Color3.fromRGB(34,36,46)
+    b.TextColor3, b.Font, b.TextSize, b.Text, b.BorderSizePixel = Color3.fromRGB(230,232,240), Enum.Font.GothamBold, 11, name, 0
+    b.Parent = win
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0,6)
+    b.MouseButton1Click:Connect(function()
+        CONFIG[name] = not CONFIG[name]
+        b.BackgroundColor3 = CONFIG[name] and Color3.fromRGB(46,110,74) or Color3.fromRGB(34,36,46)
+    end)
+end
+
+local function button(t, x, y, w, fn)
+    local b = Instance.new("TextButton")
+    b.Size, b.Position = UDim2.new(w,-14,0,24), UDim2.fromOffset(x,y)
+    b.BackgroundColor3, b.TextColor3, b.Font, b.TextSize, b.Text, b.BorderSizePixel = Color3.fromRGB(38,44,62), Color3.fromRGB(230,232,240), Enum.Font.GothamBold, 11, t, 0
+    b.Parent = win
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0,6)
+    b.MouseButton1Click:Connect(fn)
+    return b
+end
+
+toggle("autoPipeline", 10, 372)
+toggle("requireGem", 190, 372)
+toggle("autoDecline", 10, 398)
+toggle("useGroq", 190, 398)
+
+button("scan players", 10, 240, 0.5, function() end)
+button("trade nearest", 190, 240, 0.5, function()
+    local l = targets()
+    if l[1] then sendTrade(l[1].plr) end
+end)
+button("reload values", 10, 424, 0.5, function()
+    status.Text = "reloading..."
+    task.spawn(function() status.Text = loadValues() and ("values: " .. (function() local n=0 for _ in pairs(DB) do n=n+1 end return n end)()) or "failed" end)
+end)
+button("map items (groq)", 190, 424, 0.5, function() task.spawn(groqMap) end)
+button("go to plaza", 10, 448, 0.5, function() pcall(function() R.plaza:FireServer() end) end)
+button("dump remotes", 190, 448, 0.5, function()
+    for _, n in ipairs({"TradeSendRequest","TradeAddItem","TradeAccept","TradeDecline","TradeState","TradeChat","JoinTradingPlaza"}) do
+        local o = EV:FindFirstChild(n) or RF:FindFirstChild(n)
+        log(n, o and o.ClassName or "MISSING")
+    end
+end)
+
+local function clear(f) for _, c in ipairs(f:GetChildren()) do if c:IsA("TextLabel") then c:Destroy() end end
+
+local function updateGUI(r)
+    theirsL.Text = ("THEY: %d"):format(r.their)
+    oursL.Text = ("YOU : %d"):format(r.our)
+    deltaL.Text = ("DELTA: %+d (%.0f%%)"):format(r.delta, r.pct)
+    deltaL.TextColor3 = r.delta > 0 and Color3.fromRGB(90,199,122) or r.delta < 0 and Color3.fromRGB(242,85,90) or Color3.fromRGB(255,255,255)
+    gemL.Text = "gem in offer: " .. (r.gem and "YES" or "no")
+    gemL.TextColor3 = r.gem and Color3.fromRGB(232,194,74) or Color3.fromRGB(140,145,160)
+    clear(itemList)
+    local y = 0
+    for _, it in ipairs(r.tItems) do
+        local l = lbl(("+ %s x%d (%d)"):format(it.name, it.qty, it.value*it.qty), 0, it.gem and Color3.fromRGB(232,194,74) or Color3.fromRGB(90,199,122), 11)
+        l.Size, l.Position, l.Parent = UDim2.new(1,-8,0,15), UDim2.fromOffset(4,y), itemList
+        y = y + 15
+    end
+    for _, it in ipairs(r.oItems) do
+        local l = lbl(("- %s x%d (%d)"):format(it.name, it.qty, it.value*it.qty), 0, Color3.fromRGB(242,85,90), 11)
+        l.Size, l.Position, l.Parent = UDim2.new(1,-8,0,15), UDim2.fromOffset(4,y), itemList
+        y = y + 15
+    end
+end
+
+local function refreshPlayers()
+    clear(playerList)
+    local y = 0
+    for _, e in ipairs(targets()) do
+        local b = Instance.new("TextButton")
+        b.Size, b.Position = UDim2.new(1,-8,0,16), UDim2.fromOffset(4,y)
+        b.BackgroundTransparency, b.TextXAlignment = 1, Enum.TextXAlignment.Left
+        b.Font, b.TextSize = Enum.Font.Gotham, 11
+        b.TextColor3 = Color3.fromRGB(190,195,210)
+        b.Text = ("%s  (%dm)"):format(e.plr.Name, math.floor(e.dist))
+        b.Parent = playerList
+        b.MouseButton1Click:Connect(function() sendTrade(e.plr) end)
+        y = y + 16
+    end
+end
+
+onChange.Event:Connect(function() task.spawn(function() updateGUI(evaluate()) end) end)
+task.spawn(function() while true do task.wait(2) refreshPlayers() end end)
+
+task.spawn(function()
+    if loadValues() then status.Text = "values: " .. (function() local n=0 for _ in pairs(DB) do n=n+1 end return n end)()
+    else status.Text = "value load failed" end
+    resetTrade()
+end)
+log("v2 loaded")
