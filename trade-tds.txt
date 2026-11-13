@@ -1,0 +1,577 @@
+--[[
+  Cameraman Tower Defense — Auto Win Trade
+  Values: cameraman-td.vaultedvaluesx.com/value-list (scraped, embedded RSC JSON)
+  Remotes: ModuleLoader.Shared.Network.{RemoteEvent,RemoteFunction}
+  Features: live win/loss valuation, gem tagging, auto-accept profitable, auto-send, remote registry
+]]
+
+if getgenv().CTD_AWT_LOADED then pcall(function() getgenv().CTD_AWT:Destroy() end) end
+getgenv().CTD_AWT_LOADED = true
+
+local CONFIG = {
+    minWinPct      = 0.10,   -- accept when their value >= ours * 1.10
+    minWinAbs      = 50,     -- ...or when absolute gain >= this
+    minTheirValue  = 100,    -- ignore junk offers below this
+    autoAccept     = true,
+    autoSend       = false,
+    autoDecline    = true,
+    declineLossPct = 0.30,   -- auto-decline if we lose >30%
+    acceptDelay    = 1.2,
+    sendCooldown   = 12,
+    maxOfferValue  = 6000,   -- don't offer more than this when auto-sending
+    requireGem     = false,  -- only accept offers containing a gem item
+    gemKeywords    = { "gem", "gems" },
+    ocValue        = 0,      -- value used for "o/c" items (0 = ignore)
+    valueUrl       = "https://cameraman-td.vaultedvaluesx.com/value-list",
+}
+
+local Players, RS, RunService, UIS =
+    game:GetService("Players"), game:GetService("ReplicatedStorage"),
+    game:GetService("RunService"), game:GetService("UserInputService")
+local LP = Players.LocalPlayer
+
+local function net()
+    local ok, m = pcall(function()
+        return RS:WaitForChild("ModuleLoader", 15):WaitForChild("Shared", 15):WaitForChild("Network", 15)
+    end)
+    return ok and m or nil
+end
+local NET = net()
+local function ev(name) local p = NET and (NET:FindFirstChild("RemoteEvent") or NET):FindFirstChild(name); return p end
+local function rf(name) local p = NET and (NET:FindFirstChild("RemoteFunction") or NET):FindFirstChild(name); return p end
+
+-- ============ REMOTE REGISTRY ============
+local REMOTES = {
+    Events = {
+        "AutosellEnable","BuyCrate","ChatNotificate","CheckUpdateLog","ClaimRankReward","ConfettiUI",
+        "ElevatorEntered","ElevatorLeft","ElevatorModifiersUpdated","ElevatorPlayersUpdated","ElevatorTeleporting",
+        "EquipPart","JoinAFK","JoinTradingPlaza","MatchPartyInvite","MatchUpdate","Notificate","OpenAnim",
+        "QuestCompleted","RedeemCode","RejoinClear","RejoinRequest","RequestQuestData","SellPart",
+        "SendPassQuestData","SendQuestData","SignPart","SummonSetUpdated","TradeAccept","TradeChat",
+        "TradeDecline","TradeDeclineRequest","TradeSendRequest","TradeState","UpdateExist",
+        "UpdateLeaderstats","UseBoost",
+    },
+    Functions = {
+        "AdminRequest","BuyBattlepassPremium","ClaimTier","CollectPassQuest","CollectQuest","ElevatorEnter",
+        "ElevatorLeave","ElevatorSetModifiers","ElevatorStart","GetAllExists","GetExist","GetPlayerSlots",
+        "GetSummonSet","MarkUpdateLogRead","MatchJoinQueue","MatchLeaveQueue","MatchPartyAction","MatchStatus",
+        "OpenCrate","OpenGamepass","SummonTowers","TradeAcceptRequest","TradeAddItem","TradeGetModes",
+        "TradeRemoveItem","TradeSetCurrency","UpdateSetting",
+    },
+    Replica = { "ReplicaBind","ReplicaCreate","ReplicaDestroy","ReplicaParent","ReplicaRequestData",
+                "ReplicaSet","ReplicaSetValues","ReplicaSignal","ReplicaTableInsert","ReplicaTableRemove","ReplicaWrite" },
+}
+
+local function resolveRemote(kind, name)
+    if kind == "Functions" then return rf(name) end
+    if kind == "Replica" then
+        local f = RS:FindFirstChild("RemoteEvents")
+        return f and f:FindFirstChild(name)
+    end
+    return ev(name)
+end
+
+local function dumpRemotes()
+    local n = 0
+    for kind, list in pairs(REMOTES) do
+        for _, name in ipairs(list) do
+            local obj = resolveRemote(kind, name)
+            print(("[CTD] %-10s %-26s %s"):format(kind, name, obj and obj.ClassName or "MISSING"))
+            n = n + 1
+        end
+    end
+    print(("[CTD] %d remotes resolved"):format(n))
+end
+
+-- ============ VALUE DATABASE ============
+local DB, DBReady = {}, false
+local function norm(s)
+    return (tostring(s):lower():gsub("[%s%-_]+", " "):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+local function isGem(name)
+    local l = tostring(name):lower()
+    for _, k in ipairs(CONFIG.gemKeywords) do if l:find(k, 1, true) then return true end end
+    return false
+end
+
+local function fetch(url)
+    local req = (syn and syn.request) or (http and http.request) or http_request or request
+    if req then
+        local ok, res = pcall(req, { Url = url, Method = "GET", Headers = { ["User-Agent"] = "Mozilla/5.0" } })
+        if ok and res and (res.Body or res.body) then return res.Body or res.body end
+    end
+    local ok, body = pcall(function() return game:HttpGet(url, true) end)
+    return ok and body or nil
+end
+
+local function parseItems(html)
+    local body = html:gsub('\\"', '"'):gsub("\\\\/", "/")
+    local out, pos = {}, 1
+    while true do
+        local s = body:find('{"id":"', pos, true)
+        if not s then break end
+        local nxt = body:find('{"id":"', s + 1, true) or (#body + 1)
+        local chunk = body:sub(s, nxt)
+        pos = nxt
+        if chunk:find('"displayFields"', 1, true) then
+            local name = chunk:match('"name":"(.-)"')
+            local rawv = chunk:match('"label":"Value","value":(%b{})')
+                      or chunk:match('"label":"Value","value":"(.-)"')
+                      or chunk:match('"label":"Value","value":([%d%.]+)')
+            if name and rawv then
+                local val
+                if rawv:sub(1, 1) == "{" then
+                    local lo, hi = rawv:match('"low":(%d+),"high":(%d+)')
+                    if lo then val = (tonumber(lo) + tonumber(hi)) / 2 end
+                else
+                    val = tonumber(rawv)
+                end
+                local key = norm(name)
+                if key ~= "" then
+                    out[key] = { name = name, value = val or CONFIG.ocValue, raw = rawv, gem = isGem(name) }
+                end
+            end
+        end
+    end
+    return out
+end
+
+local function loadValues(silent)
+    local body = fetch(CONFIG.valueUrl)
+    if not body then
+        if not silent then warn("[CTD] value fetch failed") end
+        return false
+    end
+    local parsed = parseItems(body)
+    local count = 0
+    for k in pairs(parsed) do count = count + 1 end
+    if count < 20 then
+        if not silent then warn("[CTD] parse produced only " .. count .. " items") end
+        return false
+    end
+    DB, DBReady = parsed, true
+    print(("[CTD] value database loaded: %d items"):format(count))
+    return true
+end
+
+local function valueOf(name)
+    local e = DB[norm(name)]
+    return e and e.value or 0, e
+end
+
+-- ============ INVENTORY (Replica sniff) ============
+local Profiles = {}
+local function deepCollect(v, out, depth)
+    depth = depth or 0
+    if depth > 7 or type(v) ~= "table" then return out end
+    local uuid, nm
+    for k, x in pairs(v) do
+        if type(x) == "string" then
+            if x:match("^%x%x%x%x%x%x%x%x%-") then uuid = x end
+            local lk = tostring(k):lower()
+            if lk == "name" or lk == "itemname" or lk == "item" then nm = x end
+        end
+    end
+    if uuid and nm and DB[norm(nm)] then
+        out[#out + 1] = { uuid = uuid, name = nm, value = valueOf(nm) }
+    end
+    for _, x in pairs(v) do if type(x) == "table" then deepCollect(x, out, depth + 1) end end
+    return out
+end
+
+local function getInventory()
+    local list = {}
+    for _, prof in pairs(Profiles) do deepCollect(prof, list) end
+    table.sort(list, function(a, b) return a.value < b.value end)
+    return list
+end
+
+task.spawn(function()
+    local rev = RS:FindFirstChild("RemoteEvents")
+    local create = rev and rev:FindFirstChild("ReplicaCreate")
+    if create then
+        create.OnClientEvent:Connect(function(id, data)
+            if type(data) == "table" then Profiles[id] = data end
+        end)
+    end
+end)
+
+-- ============ TRADE STATE TRACKING ============
+local State = { ourCounts = {}, theirCounts = {}, open = false, lastAccept = 0, lastDecline = 0 }
+
+local function resetOffer()
+    State.ourCounts, State.theirCounts, State.open = {}, {}, false
+end
+
+local function bump(t, name, d)
+    local k = norm(name)
+    t[k] = math.max(0, (t[k] or 0) + d)
+    if t[k] == 0 then t[k] = nil end
+end
+
+local function deepStrings(v, out, depth)
+    depth = depth or 0
+    if depth > 7 then return out end
+    if type(v) == "string" then out[#out + 1] = v
+    elseif type(v) == "table" then
+        for k, x in pairs(v) do
+            if type(k) == "string" then out[#out + 1] = k end
+            deepStrings(x, out, depth + 1)
+        end
+    end
+    return out
+end
+
+local function scoreFromCounts(counts)
+    local total, items = 0, {}
+    for k, n in pairs(counts) do
+        local e = DB[k]
+        if e then
+            total = total + (e.value * n)
+            items[#items + 1] = { name = e.name, value = e.value, qty = n, gem = e.gem }
+        end
+    end
+    table.sort(items, function(a, b) return a.value > b.value end)
+    return total, items
+end
+
+local addRemote, remRemote = ev("TradeAddItem"), ev("TradeRemoveItem")
+
+-- our own adds are authoritative for "our side"
+if addRemote then
+    addRemote.OnClientEvent:Connect(function(...)
+        for _, s in ipairs({ ... }) do
+            if type(s) == "string" and DB[norm(s)] then bump(State.ourCounts, s, 1) end
+        end
+    end)
+end
+if remRemote then
+    remRemote.OnClientEvent:Connect(function(...)
+        for _, s in ipairs({ ... }) do
+            if type(s) == "string" and DB[norm(s)] then bump(State.ourCounts, s, -1) end
+        end
+    end)
+end
+
+local tradeState = ev("TradeState")
+local onChange = Instance.new("BindableEvent")
+
+if tradeState then
+    tradeState.OnClientEvent:Connect(function(...)
+        local args = { ... }
+        local names = deepStrings(args, {})
+
+        -- their side = every DB name not already claimed by our local offer
+        local budget, theirs = {}, {}
+        for k, n in pairs(State.ourCounts) do budget[k] = n end
+        for _, s in ipairs(names) do
+            local k = norm(s)
+            if DB[k] then
+                if (budget[k] or 0) > 0 then
+                    budget[k] = budget[k] - 1
+                else
+                    theirs[k] = (theirs[k] or 0) + 1
+                end
+            end
+        end
+        State.theirCounts = theirs
+
+        local flat = table.concat(names, " "):lower()
+        State.open = flat:find("trade") ~= nil and not flat:find("declin")
+        onChange:Fire()
+    end)
+end
+
+-- ============ EVALUATION + AUTO LOGIC ============
+local function evaluate()
+    local tv, tItems = scoreFromCounts(State.theirCounts)
+    local ov, oItems = scoreFromCounts(State.ourCounts)
+    local delta = tv - ov
+    local pct = ov > 0 and (delta / ov) or (delta > 0 and math.huge or 0)
+    local hasGem = false
+    for _, it in ipairs(tItems) do if it.gem then hasGem = true break end end
+    return { their = tv, our = ov, delta = delta, pct = pct, tItems = tItems, oItems = oItems, gem = hasGem }
+end
+
+local function shouldAccept(r)
+    if r.their < CONFIG.minTheirValue then return false end
+    if CONFIG.requireGem and not r.gem then return false end
+    if r.delta >= CONFIG.minWinAbs then return true end
+    if r.our == 0 and r.their > 0 then return true end
+    return r.ov ~= nil and r.pct >= CONFIG.minWinPct
+end
+
+local acceptEv, acceptReq, declineEv, declineReq = ev("TradeAccept"), rf("TradeAcceptRequest"), ev("TradeDecline"), ev("TradeDeclineRequest")
+
+local function doAccept()
+    if os.clock() - State.lastAccept < 3 then return end
+    State.lastAccept = os.clock()
+    if acceptReq then pcall(acceptReq.InvokeServer, acceptReq) end
+    task.wait(0.25)
+    if acceptEv then pcall(function() acceptEv:FireServer() end) end
+end
+
+local function doDecline()
+    if os.clock() - State.lastDecline < 3 then return end
+    State.lastDecline = os.clock()
+    if declineReq then pcall(declineReq.InvokeServer, declineReq) end
+    task.wait(0.2)
+    if declineEv then pcall(function() declineEv:FireServer() end) end
+end
+
+local autoBusy = false
+onChange.Event:Connect(function()
+    local r = evaluate()
+    task.spawn(function() updateGUI(r) end)
+    if autoBusy then return end
+    autoBusy = true
+    task.delay(CONFIG.acceptDelay, function()
+        autoBusy = false
+        local r2 = evaluate()
+        if CONFIG.autoAccept and State.open and shouldAccept(r2) then
+            print(("[CTD] ACCEPT +%d (%s)"):format(r2.delta, r2.gem and "gem" or "no-gem"))
+            doAccept()
+        elseif CONFIG.autoDecline and State.open and r2.our > 0 and r2.pct < -CONFIG.declineLossPct then
+            print(("[CTD] DECLINE %d%%"):format(math.floor(r2.pct * 100)))
+            doDecline()
+        end
+    end)
+end)
+
+-- ============ AUTO SEND ============
+local sendEv, addItemFn, plazaEv = ev("TradeSendRequest"), rf("TradeAddItem"), ev("JoinTradingPlaza")
+local blacklist, lastSend = {}, 0
+
+local function candidates()
+    local out = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LP and not blacklist[p] then out[#out + 1] = p end
+    end
+    return out
+end
+
+local function autoSendTo(target)
+    if not sendEv or not target then return end
+    resetOffer()
+    pcall(function() sendEv:FireServer(target) end)
+    print("[CTD] request sent to " .. target.Name)
+
+    -- wait for the window, then build a cheap offer
+    local t0 = os.clock()
+    while os.clock() - t0 < 8 do
+        task.wait(0.3)
+        if State.open then break end
+    end
+    if not State.open then
+        blacklist[target] = true
+        return
+    end
+    if not addItemFn then return end
+
+    local inv = getInventory()
+    local spent = 0
+    for _, it in ipairs(inv) do
+        if spent >= CONFIG.maxOfferValue then break end
+        if not it.gem or spent < CONFIG.maxOfferValue * 0.5 then
+            pcall(function() addItemFn.InvokeServer(addItemFn, it.uuid) end)
+            spent = spent + it.value
+            task.wait(0.15)
+        end
+    end
+    print(("[CTD] offered %d value"):format(spent))
+end
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if CONFIG.autoSend and not State.open and os.clock() - lastSend > CONFIG.sendCooldown then
+            local list = candidates()
+            local tgt = list[math.random(1, math.max(1, #list))]
+            if tgt then
+                lastSend = os.clock()
+                autoSendTo(tgt)
+            end
+        end
+    end
+end)
+
+-- ============ GUI ============
+local gui = Instance.new("ScreenGui")
+gui.Name = "CTD_AWT"
+gui.ResetOnSpawn = false
+gui.Parent = (gethui and gethui()) or LP:WaitForChild("PlayerGui")
+getgenv().CTD_AWT = gui
+
+local win = Instance.new("Frame")
+win.Size = UDim2.fromOffset(340, 400)
+win.Position = UDim2.fromOffset(24, 90)
+win.BackgroundColor3 = Color3.fromRGB(14, 15, 20)
+win.BorderSizePixel = 0
+win.Active = true
+win.Draggable = true
+win.Parent = gui
+Instance.new("UICorner", win).CornerRadius = UDim.new(0, 10)
+local stroke = Instance.new("UIStroke", win)
+stroke.Color = Color3.fromRGB(48, 52, 66)
+stroke.Thickness = 1
+
+local function label(txt, y, color, size, bold)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(1, -20, 0, size or 18)
+    l.Position = UDim2.fromOffset(10, y)
+    l.BackgroundTransparency = 1
+    l.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+    l.TextSize = size or 13
+    l.TextColor3 = color or Color3.fromRGB(200, 204, 214)
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Text = txt
+    l.Parent = win
+    return l
+end
+
+label("CTD AUTO WIN TRADE", 8, Color3.fromRGB(255, 255, 255), 15, true)
+local statusL = label("loading values...", 28, Color3.fromRGB(140, 145, 160), 11)
+
+local theirsL = label("THEY: 0", 52, Color3.fromRGB(90, 199, 122), 14, true)
+local oursL   = label("YOU : 0", 72, Color3.fromRGB(242, 85, 90), 14, true)
+local deltaL  = label("DELTA: 0 (0%)", 92, Color3.fromRGB(255, 255, 255), 16, true)
+local gemL    = label("gem: -", 114, Color3.fromRGB(140, 145, 160), 11)
+
+local listFrame = Instance.new("ScrollingFrame")
+listFrame.Size = UDim2.new(1, -20, 0, 130)
+listFrame.Position = UDim2.fromOffset(10, 136)
+listFrame.BackgroundColor3 = Color3.fromRGB(19, 21, 29)
+listFrame.BorderSizePixel = 0
+listFrame.ScrollBarThickness = 4
+listFrame.CanvasSize = UDim2.new()
+listFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+listFrame.Parent = win
+Instance.new("UICorner", listFrame).CornerRadius = UDim.new(0, 6)
+local ll = Instance.new("UIListLayout", listFrame)
+ll.Padding = UDim.new(0, 1)
+
+local y = 0
+local function toggle(name, key, yPos)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0.5, -14, 0, 26)
+    b.Position = UDim2.fromOffset(10 + (key and 1 or 0) * (b.Size.X.Offset + 8), yPos)
+    b.BackgroundColor3 = CONFIG[name] and Color3.fromRGB(46, 110, 74) or Color3.fromRGB(34, 36, 46)
+    b.TextColor3 = Color3.fromRGB(230, 232, 240)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 12
+    b.Text = name
+    b.BorderSizePixel = 0
+    b.Parent = win
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    b.MouseButton1Click:Connect(function()
+        CONFIG[name] = not CONFIG[name]
+        b.BackgroundColor3 = CONFIG[name] and Color3.fromRGB(46, 110, 74) or Color3.fromRGB(34, 36, 46)
+    end)
+    return b
+end
+
+toggle("autoAccept", false, 272)
+toggle("autoSend", true, 272)
+toggle("autoDecline", false, 300)
+toggle("requireGem", true, 300)
+
+local refreshB = Instance.new("TextButton")
+refreshB.Size = UDim2.new(0.5, -14, 0, 26)
+refreshB.Position = UDim2.fromOffset(10, 328)
+refreshB.BackgroundColor3 = Color3.fromRGB(38, 44, 62)
+refreshB.TextColor3 = Color3.fromRGB(230, 232, 240)
+refreshB.Font = Enum.Font.GothamBold
+refreshB.TextSize = 12
+refreshB.Text = "reload values"
+refreshB.BorderSizePixel = 0
+refreshB.Parent = win
+Instance.new("UICorner", refreshB).CornerRadius = UDim.new(0, 6)
+refreshB.MouseButton1Click:Connect(function()
+    statusL.Text = "reloading..."
+    task.spawn(function()
+        if loadValues() then statusL.Text = ("values: %d items"):format((function() local n = 0 for _ in pairs(DB) do n = n + 1 end return n end)()) else statusL.Text = "reload failed" end
+    end)
+end)
+
+local plazaB = Instance.new("TextButton")
+plazaB.Size = UDim2.new(0.5, -14, 0, 26)
+plazaB.Position = UDim2.fromOffset(10 + refreshB.Size.X.Offset + 8, 328)
+plazaB.BackgroundColor3 = Color3.fromRGB(38, 44, 62)
+plazaB.TextColor3 = Color3.fromRGB(230, 232, 240)
+plazaB.Font = Enum.Font.GothamBold
+plazaB.TextSize = 12
+plazaB.Text = "go to plaza"
+plazaB.BorderSizePixel = 0
+plazaB.Parent = win
+Instance.new("UICorner", plazaB).CornerRadius = UDim.new(0, 6)
+plazaB.MouseButton1Click:Connect(function()
+    if plazaEv then pcall(function() plazaEv:FireServer() end) end
+end)
+
+local dumpB = Instance.new("TextButton")
+dumpB.Size = UDim2.new(1, -20, 0, 24)
+dumpB.Position = UDim2.fromOffset(10, 360)
+dumpB.BackgroundColor3 = Color3.fromRGB(38, 44, 62)
+dumpB.TextColor3 = Color3.fromRGB(230, 232, 240)
+dumpB.Font = Enum.Font.Gotham
+dumpB.TextSize = 11
+dumpB.Text = "dump remotes to console"
+dumpB.BorderSizePixel = 0
+dumpB.Parent = win
+Instance.new("UICorner", dumpB).CornerRadius = UDim.new(0, 6)
+dumpB.MouseButton1Click:Connect(dumpRemotes)
+
+function updateGUI(r)
+    theirsL.Text = ("THEY: %d"):format(r.their)
+    oursL.Text = ("YOU : %d"):format(r.our)
+    deltaL.Text = ("DELTA: %+d (%.0f%%)"):format(r.delta, r.pct == math.huge and 999 or r.pct * 100)
+    deltaL.TextColor3 = r.delta > 0 and Color3.fromRGB(90, 199, 122)
+        or r.delta < 0 and Color3.fromRGB(242, 85, 90)
+        or Color3.fromRGB(255, 255, 255)
+    gemL.Text = "gem in offer: " .. (r.gem and "YES" or "no")
+    gemL.TextColor3 = r.gem and Color3.fromRGB(232, 194, 74) or Color3.fromRGB(140, 145, 160)
+
+    for _, c in ipairs(listFrame:GetChildren()) do
+        if c:IsA("TextLabel") then c:Destroy() end
+    end
+    local yy = 0
+    for _, it in ipairs(r.tItems) do
+        local l = Instance.new("TextLabel")
+        l.Size = UDim2.new(1, -8, 0, 15)
+        l.Position = UDim2.fromOffset(4, yy)
+        l.BackgroundTransparency = 1
+        l.Font = Enum.Font.Gotham
+        l.TextSize = 11
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        l.TextColor3 = it.gem and Color3.fromRGB(232, 194, 74) or Color3.fromRGB(90, 199, 122)
+        l.Text = ("+ %s x%d  (%d)"):format(it.name, it.qty, it.value * it.qty)
+        l.Parent = listFrame
+        yy = yy + 15
+    end
+    for _, it in ipairs(r.oItems) do
+        local l = Instance.new("TextLabel")
+        l.Size = UDim2.new(1, -8, 0, 15)
+        l.Position = UDim2.fromOffset(4, yy)
+        l.BackgroundTransparency = 1
+        l.Font = Enum.Font.Gotham
+        l.TextSize = 11
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        l.TextColor3 = Color3.fromRGB(242, 85, 90)
+        l.Text = ("- %s x%d  (%d)"):format(it.name, it.qty, it.value * it.qty)
+        l.Parent = listFrame
+        yy = yy + 15
+    end
+end
+
+-- ============ BOOT ============
+task.spawn(function()
+    if not NET then
+        statusL.Text = "network module not found"
+        return
+    end
+    local ok = loadValues()
+    statusL.Text = ok and ("values: %d items"):format((function() local n = 0 for _ in pairs(DB) do n = n + 1 end return n end)()) or "value load failed"
+    resetOffer()
+end)
+
+print("[CTD] loaded. remotes resolved via ModuleLoader.Shared.Network")
