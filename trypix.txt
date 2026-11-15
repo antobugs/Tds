@@ -1,0 +1,699 @@
+if getgenv().CTD_AWT then pcall(function() getgenv().CTD_AWT:Destroy() end) end
+getgenv().CTD_AWT = nil
+
+local CFG = {
+    valueUrl = "https://cameraman-td.vaultedvaluesx.com/value-list",
+    adsUrl = "https://cameraman-td.vaultedvaluesx.com/trade-ads?list=0d2a00fc-86ef-898e-a0fc-c047bc5daf93",
+    minWinPct = 0.10, minWinAbs = 50, minTheirValue = 100, gemValue = 1,
+    targetOffer = 1500, maxOfferValue = 4000, offerGems = 0,
+    autoPipeline = false, autoJoin = true, requireGem = false, autoDecline = true,
+    declineLossPct = 0.35, confirmDelay = 1.2, sendCooldown = 10,
+    openTimeout = 12, tradeTimeout = 45, slotStart = 1, chatLine = "auto trade",
+    refresh = 300,
+}
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local HS = game:GetService("HttpService")
+local LP = Players.LocalPlayer
+local NET = RS:WaitForChild("ModuleLoader"):WaitForChild("Shared"):WaitForChild("Network")
+local EV = NET:WaitForChild("RemoteEvent")
+local RF = NET:WaitForChild("RemoteFunction")
+local REP = RS:WaitForChild("RemoteEvents")
+
+local function ev(n) local o = EV:FindFirstChild(n) if not o then pcall(function() o = EV:WaitForChild(n, 15) end) end return o end
+local function rf(n) local o = RF:FindFirstChild(n) if not o then pcall(function() o = RF:WaitForChild(n, 15) end) end return o end
+local function fire(r, ...) if r then pcall(r.FireServer, r, ...) end end
+local function invoke(r, ...) if r then return pcall(r.InvokeServer, r, ...) end return false end
+
+local R = {
+    send = ev("TradeSendRequest"), join = rf("TradeAcceptRequest"), add = rf("TradeAddItem"),
+    remove = rf("TradeRemoveItem"), currency = rf("TradeSetCurrency"), accept = ev("TradeAccept"),
+    decline = ev("TradeDecline"), state = ev("TradeState"), chat = ev("TradeChat"),
+    plaza = ev("JoinTradingPlaza"), afk = ev("JoinAFK"), autosell = ev("AutosellEnable"),
+    code = ev("RedeemCode"), crate = ev("BuyCrate"), boost = ev("UseBoost"),
+}
+
+local NAMES = {
+    "AutosellEnable","BuyCrate","ChatNotificate","CheckUpdateLog","ClaimRankReward","ConfettiUI",
+    "CountdownUpdate","ElevatorEntered","ElevatorLeft","ElevatorModifiersUpdated","ElevatorPlayersUpdated",
+    "ElevatorTeleporting","EquipPart","JoinAFK","JoinTradingPlaza","MatchPartyInvite","MatchUpdate",
+    "Notificate","OpenAnim","QuestCompleted","RedeemCode","RejoinClear","RejoinRequest","RequestQuestData",
+    "SellPart","SendPassQuestData","SendQuestData","SignPart","SummonSetUpdated","TradeAccept","TradeChat",
+    "TradeDecline","TradeDeclineRequest","TradeSendRequest","TradeState","UpdateExist","UpdateLeaderstats","UseBoost",
+}
+
+local DB, Profiles, UIndex, LOG = {}, {}, {}, {}
+local onChange = Instance.new("BindableEvent")
+local S = { tid = nil, myOrd = 2, our = {}, their = {}, ourGems = 0, theirGems = 0, open = false, joined = false, slot = 0, lastAccept = 0 }
+local SESSION = { gain = 0, count = 0, best = 0 }
+local DBSTATE, lastLoad, loading, busy = "STALE", 0, false, false
+
+local function log(...)
+    local t = {}
+    for i = 1, select("#", ...) do t[#t + 1] = tostring(select(i, ...)) end
+    local line = ("[%s] %s"):format(os.date("%H:%M:%S"), table.concat(t, " "))
+    LOG[#LOG + 1] = line
+    if #LOG > 120 then table.remove(LOG, 1) end
+    print("[CTD]", line)
+    if renderLog then task.spawn(renderLog) end
+end
+
+local function norm(s) return (tostring(s):lower():gsub("[%s%-_]+", " "):gsub("^%s+", ""):gsub("%s+$", "")) end
+local function isGem(n) return tostring(n):lower():find("gem", 1, true) ~= nil end
+
+local function fetch(url, hdr)
+    local req = (syn and syn.request) or (http and http.request) or http_request or request
+    if req then
+        local ok, res = pcall(req, { Url = url, Method = "GET", Headers = hdr or {} })
+        if ok and res then return res.Body or res.body end
+    end
+    local ok, b = pcall(function() return game:HttpGet(url, true) end)
+    return ok and b or nil
+end
+
+local HDR = {
+    ["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36",
+    ["Accept"] = "text/html,application/xhtml+xml",
+    ["Accept-Language"] = "en-US,en;q=0.9",
+}
+
+local function parseItems(html)
+    local b = html:gsub('\\"', '"'):gsub("\\\\/", "/")
+    local out, pos = {}, 1
+    while true do
+        local s = b:find('{"id":"', pos, true)
+        if not s then break end
+        local nxt = b:find('{"id":"', s + 1, true) or (#b + 1)
+        local c = b:sub(s, nxt)
+        pos = nxt
+        if c:find('"displayFields"', 1, true) then
+            local name = c:match('"name":"(.-)"')
+            local raw = c:match('"label":"Value","value":(%b{})') or c:match('"label":"Value","value":"(.-)"') or c:match('"label":"Value","value":([%d%.]+)')
+            if name and raw then
+                local v
+                if raw:sub(1, 1) == "{" then
+                    local lo, hi = raw:match('"low":(%d+),"high":(%d+)')
+                    if lo then v = (tonumber(lo) + tonumber(hi)) / 2 end
+                else v = tonumber(raw) end
+                local k = norm(name)
+                if k ~= "" and v then out[k] = { name = name, value = v } end
+            end
+        end
+    end
+    return out
+end
+
+local function parseMd(md)
+    local out, cur = {}, nil
+    for line in md:gmatch("[^\n]+") do
+        local n = line:match("^###%s*%[([^%]]+)%]")
+        if n then
+            cur = n
+        else
+            local v = line:match("^Value%s*([%d,]+)")
+            if cur and v then
+                local k = norm(cur)
+                local lo = tonumber((v:gsub(",", "")))
+                if lo and k ~= "" then out[k] = { name = cur, value = lo } end
+                cur = nil
+            end
+        end
+    end
+    return out
+end
+
+local function merge(a, b) for k, v in pairs(b) do a[k] = v end return a end
+
+local function loadValues(force)
+    if loading then return DBSTATE ~= "STALE" end
+    if not force and os.clock() - lastLoad < CFG.refresh then return DBSTATE ~= "STALE" end
+    loading = true
+    local out, best = {}, 0
+    for _ = 1, 3 do
+        local body = fetch(CFG.valueUrl, HDR)
+        if body and body:find('"items"', 1, true) then
+            local p = parseItems(body)
+            local n = 0
+            for _ in pairs(p) do n = n + 1 end
+            if n > best then best = n merge(out, p) end
+            if n >= 40 then break end
+        end
+        task.wait(1)
+    end
+    if best < 40 then
+        local md = fetch("https://r.jina.ai/" .. CFG.valueUrl)
+        if md then
+            local p = parseMd(md)
+            local n = 0
+            for _ in pairs(p) do n = n + 1 end
+            if n > best then best = n merge(out, p) end
+        end
+    end
+    if best > 0 then DB = merge(DB, out) end
+    DBSTATE = best >= 40 and "LIVE" or (best > 0 and "PARTIAL" or "STALE")
+    lastLoad = os.clock()
+    loading = false
+    local total = 0
+    for _ in pairs(DB) do total = total + 1 end
+    log("values", DBSTATE, best, "/", total)
+    onChange:Fire()
+    return DBSTATE ~= "STALE"
+end
+
+local function valueOf(n) local e = DB[norm(n)] return e and e.value or 0 end
+
+local function inv()
+    local l, p = {}, Profiles[LP.UserId]
+    if p and type(p.Towers) == "table" then
+        for uuid, t in pairs(p.Towers) do
+            if type(t) == "table" and type(t.Name) == "string" and DB[norm(t.Name)] then
+                UIndex[uuid] = t.Name
+                l[#l + 1] = { uuid = uuid, name = t.Name, cat = t.ItemType or "Tower", value = valueOf(t.Name) }
+            end
+        end
+    end
+    table.sort(l, function(a, b) return a.value < b.value end)
+    return l
+end
+
+local function score(c, gems)
+    local t, items, unk = 0, {}, 0
+    for k, n in pairs(c) do
+        local e = DB[k]
+        if e then
+            t = t + e.value * n
+            items[#items + 1] = { name = e.name, value = e.value, qty = n, gem = isGem(e.name) }
+        else
+            unk = unk + n
+            items[#items + 1] = { name = k, value = 0, qty = n, unknown = true }
+        end
+    end
+    table.sort(items, function(a, b) return a.value > b.value end)
+    return t + (gems or 0) * CFG.gemValue, items, unk
+end
+
+local function evaluate()
+    local tv, ti, unk = score(S.their, S.theirGems)
+    local ov, oi = score(S.our, S.ourGems)
+    local d = tv - ov
+    local gem = S.theirGems > 0
+    for _, it in ipairs(ti) do if it.gem then gem = true break end end
+    return { their = tv, our = ov, delta = d, pct = ov > 0 and d / ov or (d > 0 and 999 or 0),
+             tItems = ti, oItems = oi, gem = gem, tg = S.theirGems, og = S.ourGems, unknown = unk }
+end
+
+local function profitable(r)
+    if DBSTATE == "STALE" then return false end
+    if r.unknown > 0 then return false end
+    if r.their < CFG.minTheirValue then return false end
+    if CFG.requireGem and not r.gem then return false end
+    if r.our == 0 and r.their > 0 then return true end
+    return r.delta >= CFG.minWinAbs or r.pct >= CFG.minWinPct
+end
+
+local function resetTrade()
+    S.tid, S.our, S.their, S.open, S.joined, S.slot = nil, {}, {}, false, false, 0
+    S.ourGems, S.theirGems = 0, 0
+end
+
+local function addItem(uuid, cat)
+    if not S.tid then return end
+    S.slot = S.slot + 1
+    if invoke(R.add, S.tid, CFG.slotStart + S.slot - 1, uuid, cat) then
+        local nm = UIndex[uuid]
+        if nm then S.our[norm(nm)] = (S.our[norm(nm)] or 0) + 1 end
+        onChange:Fire()
+    end
+end
+
+local function doAccept()
+    if not S.tid or os.clock() - S.lastAccept < 3 then return end
+    S.lastAccept = os.clock()
+    local r = evaluate()
+    SESSION.gain = SESSION.gain + r.delta
+    SESSION.count = SESSION.count + 1
+    if r.delta > SESSION.best then SESSION.best = r.delta end
+    log("accept", ("%+d"):format(r.delta))
+    fire(R.accept, S.tid, S.myOrd, "Accept")
+    task.delay(CFG.confirmDelay, function() fire(R.accept, S.tid, S.myOrd, "Confirm") end)
+    onChange:Fire()
+end
+
+local function doDecline()
+    if not S.tid then return end
+    fire(R.decline, S.tid, S.myOrd, "Decline")
+    log("decline")
+end
+
+local function sideOf(pl)
+    if type(pl) ~= "table" then return nil end
+    if pl.Player == LP or pl.UserId == LP.UserId then return "me" end
+    return "them"
+end
+
+local function countsOf(pl)
+    local t = {}
+    if type(pl) == "table" and type(pl.Items) == "table" then
+        for _, it in pairs(pl.Items) do
+            if type(it) == "table" and type(it.Name) == "string" then
+                local k = norm(it.Name)
+                t[k] = (t[k] or 0) + 1
+            end
+        end
+    end
+    return t
+end
+
+R.state.OnClientEvent:Connect(function(p)
+    if type(p) ~= "table" then return end
+    if type(p.TradeId) == "string" then S.tid = p.TradeId end
+    local p1, p2 = p.Player1, p.Player2
+    local mine, theirs
+    if sideOf(p1) == "me" then mine, theirs = p1, p2
+    elseif sideOf(p2) == "me" then mine, theirs = p2, p1
+    else mine, theirs = p2, p1 end
+    S.myOrd = (mine == p1) and 1 or 2
+    S.our = countsOf(mine)
+    S.their = countsOf(theirs)
+    S.ourGems = type(mine) == "table" and tonumber(mine.CurrencyToGive) or 0
+    S.theirGems = type(theirs) == "table" and tonumber(theirs.CurrencyToGive) or 0
+    S.open = (p.State == "OPEN" and not p.Cancelled)
+    if S.open and not S.joined and type(theirs) == "table" and theirs.Player then
+        if CFG.autoJoin and (type(mine) ~= "table" or next(mine.Items or {}) == nil) then
+            S.joined = true
+            task.spawn(function() invoke(R.join, theirs.Player, S.tid) end)
+        end
+    end
+    onChange:Fire()
+end)
+
+task.spawn(function()
+    local c = REP:FindFirstChild("ReplicaCreate")
+    if not c then return end
+    c.OnClientEvent:Connect(function(_, d)
+        if type(d) ~= "table" then return end
+        local meta, data = d[2], d[3]
+        if type(meta) == "table" and type(meta.UserId) == "number" and type(data) == "table" then
+            Profiles[meta.UserId] = data
+        end
+    end)
+end)
+
+local blacklist, lastSend = {}, 0
+
+local function targets()
+    local out = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LP and not blacklist[p] then
+            local dist = 9999
+            local a = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+            local b = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+            if a and b then dist = (a.Position - b.Position).Magnitude end
+            out[#out + 1] = { plr = p, dist = dist }
+        end
+    end
+    table.sort(out, function(x, y) return x.dist < y.dist end)
+    return out
+end
+
+local function offer()
+    local cap = math.min(CFG.targetOffer, CFG.maxOfferValue)
+    if CFG.offerGems > 0 and S.tid then invoke(R.currency, S.tid, CFG.offerGems) end
+    local spent = 0
+    for _, it in ipairs(inv()) do
+        if spent >= cap then break end
+        if not isGem(it.name) or spent < CFG.targetOffer * 0.6 then
+            addItem(it.uuid, it.cat)
+            spent = spent + it.value
+            task.wait(0.25)
+        end
+    end
+    return spent
+end
+
+local function watch()
+    local t = os.clock()
+    while os.clock() - t < CFG.tradeTimeout do
+        task.wait(0.4)
+        if not S.open then break end
+        local r = evaluate()
+        if profitable(r) then doAccept() return end
+        if CFG.autoDecline and r.our > 0 and r.pct < -CFG.declineLossPct then doDecline() return end
+    end
+end
+
+local function sendTrade(plr)
+    if busy or not plr or not DBSTATE or DBSTATE == "STALE" then return end
+    busy = true
+    resetTrade()
+    log("request", plr.Name)
+    fire(R.send, plr)
+    local t = os.clock()
+    while os.clock() - t < CFG.openTimeout and not S.tid do task.wait(0.2) end
+    if not S.tid then
+        blacklist[plr] = true
+        busy = false
+        log("no window")
+        return
+    end
+    S.joined = true
+    if CFG.chatLine ~= "" then task.delay(1, function() fire(R.chat, S.tid, CFG.chatLine) end) end
+    log("offered", offer())
+    watch()
+    task.wait(2)
+    busy = false
+end
+
+local ADS = {}
+
+local function loadAds()
+    local body = fetch(CFG.adsUrl, HDR)
+    if not body then log("ads fail") return end
+    local t = body:gsub("<[^>]->", " "):gsub("&nbsp;", " "):gsub("&#x27;", "'"):gsub("%s+", " ")
+    local out, pos = {}, 1
+    while true do
+        local s, e, user = t:find("Request Trade: message%s+([%w_]+)", pos)
+        if not s then break end
+        local nxt = t:find("Request Trade: message", e + 1) or (#t + 1)
+        local seg = t:sub(e, nxt)
+        pos = e + 1
+        local function num(tag)
+            local v, k = seg:match(tag .. "%s*([%d%.]+)%s*([Kk]?)")
+            if not v then return nil end
+            local n = tonumber(v)
+            if not n then return nil end
+            if k == "K" or k == "k" then n = n * 1000 end
+            return n
+        end
+        local has, wants = num("Has"), num("Wants")
+        if has and wants and has > wants then
+            out[#out + 1] = { user = user, has = has, wants = wants, profit = has - wants }
+        end
+    end
+    table.sort(out, function(a, b) return a.profit > b.profit end)
+    ADS = out
+    log("ads", #ADS)
+    task.spawn(renderAds)
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "CTD_AWT"
+gui.ResetOnSpawn = false
+gui.Parent = (gethui and gethui()) or LP:WaitForChild("PlayerGui")
+getgenv().CTD_AWT = gui
+
+local win = Instance.new("Frame")
+win.Size = UDim2.fromOffset(380, 520)
+win.Position = UDim2.fromOffset(30, 70)
+win.BackgroundColor3 = Color3.fromRGB(13, 14, 19)
+win.BorderSizePixel = 0
+win.Active = true
+win.Draggable = true
+win.Parent = gui
+Instance.new("UICorner", win).CornerRadius = UDim.new(0, 12)
+local stroke = Instance.new("UIStroke", win)
+stroke.Color = Color3.fromRGB(44, 48, 62)
+
+local function lbl(t, y, c, s, b, parent)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(1, -20, 0, s or 15)
+    l.Position = UDim2.fromOffset(10, y)
+    l.BackgroundTransparency = 1
+    l.Font = b and Enum.Font.GothamBold or Enum.Font.Gotham
+    l.TextSize = s or 13
+    l.TextColor3 = c or Color3.fromRGB(198, 202, 214)
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Text = t
+    l.Parent = parent or win
+    return l
+end
+
+lbl("CTD AUTO WIN TRADE", 8, Color3.fromRGB(255, 255, 255), 15, true)
+local stateL = lbl("STALE", 27, Color3.fromRGB(242, 85, 90), 11, true)
+
+local function scroll(y, h, parent)
+    local f = Instance.new("ScrollingFrame")
+    f.Size = UDim2.new(1, -20, 0, h)
+    f.Position = UDim2.fromOffset(10, y)
+    f.BackgroundColor3 = Color3.fromRGB(18, 20, 27)
+    f.BorderSizePixel = 0
+    f.ScrollBarThickness = 3
+    f.CanvasSize = UDim2.new()
+    f.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    f.Parent = parent or win
+    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 6)
+    local l = Instance.new("UIListLayout", f)
+    l.Padding = UDim.new(0, 1)
+    return f
+end
+
+local function clear(f)
+    for _, c in ipairs(f:GetChildren()) do
+        if c:IsA("TextLabel") or c:IsA("TextButton") then c:Destroy() end
+    end
+end
+
+local bar = Instance.new("Frame")
+bar.Size = UDim2.new(1, -20, 0, 24)
+bar.Position = UDim2.fromOffset(10, 44)
+bar.BackgroundTransparency = 1
+bar.Parent = win
+
+local TABS = {}
+local PAGES = {}
+
+local function page(name, x)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0.25, -4, 0, 24)
+    b.Position = UDim2.fromOffset(x, 0)
+    b.BackgroundColor3 = Color3.fromRGB(30, 33, 43)
+    b.TextColor3 = Color3.fromRGB(190, 195, 210)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 11
+    b.Text = name
+    b.BorderSizePixel = 0
+    b.Parent = bar
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(1, -20, 0, 404)
+    f.Position = UDim2.fromOffset(10, 74)
+    f.BackgroundTransparency = 1
+    f.Visible = false
+    f.Parent = win
+    TABS[name] = b
+    PAGES[name] = f
+    b.MouseButton1Click:Connect(function()
+        for k, v in pairs(PAGES) do v.Visible = (k == name) end
+        for k, v in pairs(TABS) do v.BackgroundColor3 = (k == name) and Color3.fromRGB(46, 110, 74) or Color3.fromRGB(30, 33, 43) end
+    end)
+    return f
+end
+
+local pTrade = page("TRADE", 0)
+local pSnipe = page("SNIPE", 63)
+local pRem = page("REMOTES", 126)
+local pLog = page("LOG", 189)
+
+local theirsL = lbl("THEY: 0", 0, Color3.fromRGB(90, 199, 122), 13, true, pTrade)
+local oursL = lbl("YOU : 0", 18, Color3.fromRGB(242, 85, 90), 13, true, pTrade)
+local deltaL = lbl("DELTA: 0", 36, Color3.fromRGB(255, 255, 255), 15, true, pTrade)
+local metaL = lbl("", 57, Color3.fromRGB(140, 145, 160), 10, pTrade)
+local itemList = scroll(72, 110, pTrade)
+local playerList = scroll(214, 96, pTrade)
+
+local function toggle(name, x, y, parent)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0.5, -4, 0, 22)
+    b.Position = UDim2.fromOffset(x, y)
+    b.BackgroundColor3 = CFG[name] and Color3.fromRGB(46, 110, 74) or Color3.fromRGB(30, 33, 43)
+    b.TextColor3 = Color3.fromRGB(225, 228, 238)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 10
+    b.Text = name
+    b.BorderSizePixel = 0
+    b.Parent = parent
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    b.MouseButton1Click:Connect(function()
+        CFG[name] = not CFG[name]
+        b.BackgroundColor3 = CFG[name] and Color3.fromRGB(46, 110, 74) or Color3.fromRGB(30, 33, 43)
+    end)
+end
+
+local function button(t, x, y, w, h, parent, fn)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(w, -4, 0, h)
+    b.Position = UDim2.fromOffset(x, y)
+    b.BackgroundColor3 = Color3.fromRGB(34, 38, 50)
+    b.TextColor3 = Color3.fromRGB(225, 228, 238)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 10
+    b.Text = t
+    b.BorderSizePixel = 0
+    b.Parent = parent
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    b.MouseButton1Click:Connect(fn)
+    return b
+end
+
+toggle("autoPipeline", 0, 316, pTrade)
+toggle("autoJoin", 190, 316, pTrade)
+toggle("requireGem", 0, 342, pTrade)
+toggle("autoDecline", 190, 342, pTrade)
+button("trade nearest", 0, 368, 0.5, 22, pTrade, function() local l = targets() if l[1] then sendTrade(l[1].plr) end end)
+button("go plaza", 190, 368, 0.5, 22, pTrade, function() fire(R.plaza) end)
+button("refresh values", 0, 288, 0.5, 22, pTrade, function() task.spawn(function() loadValues(true) end) end)
+button("scan players", 190, 288, 0.5, 22, pTrade, function() task.spawn(refreshPlayers) end)
+
+local gainL = lbl("session: 0", 0, Color3.fromRGB(232, 194, 74), 12, true, pSnipe)
+local bestL = lbl("best: 0  deals: 0", 18, Color3.fromRGB(160, 165, 180), 10, pSnipe)
+local adList = scroll(36, 330, pSnipe)
+button("load trade ads", 0, 372, 1, 22, pSnipe, function() task.spawn(loadAds) end)
+
+local remList = scroll(0, 350, pRem)
+local argBox = Instance.new("TextBox")
+argBox.Size = UDim2.new(1, -20, 0, 22)
+argBox.Position = UDim2.fromOffset(0, 356)
+argBox.BackgroundColor3 = Color3.fromRGB(24, 26, 34)
+argBox.TextColor3 = Color3.fromRGB(220, 223, 234)
+argBox.PlaceholderText = "arg (username / code / text)"
+argBox.PlaceholderColor3 = Color3.fromRGB(110, 115, 130)
+argBox.Font = Enum.Font.Gotham
+argBox.TextSize = 11
+argBox.BorderSizePixel = 0
+argBox.ClearTextOnFocus = false
+argBox.Parent = pRem
+Instance.new("UICorner", argBox).CornerRadius = UDim.new(0, 6)
+lbl("click a remote to fire it", 380, Color3.fromRGB(120, 125, 140), 10, false, pRem)
+
+local logBox = scroll(0, 396, pLog)
+
+for _, n in ipairs(NAMES) do
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(1, -8, 0, 16)
+    b.Position = UDim2.fromOffset(4, 0)
+    b.BackgroundTransparency = 1
+    b.TextXAlignment = Enum.TextXAlignment.Left
+    b.Font = Enum.Font.Gotham
+    b.TextSize = 11
+    b.TextColor3 = Color3.fromRGB(185, 190, 205)
+    b.Text = n
+    b.Parent = remList
+    b.MouseButton1Click:Connect(function()
+        local o = EV:FindFirstChild(n) or RF:FindFirstChild(n)
+        if not o then log(n, "missing") return end
+        local a = argBox.Text
+        local ok
+        if o:IsA("RemoteFunction") then
+            ok = invoke(o, a ~= "" and a or nil)
+        else
+            if a ~= "" then
+                local plr = Players:FindFirstChild(a)
+                fire(o, plr or a)
+            else
+                fire(o)
+            end
+            ok = true
+        end
+        log(n, ok and "fired" or "error")
+    end)
+end
+
+function renderLog()
+    clear(logBox)
+    local y = 0
+    for _, line in ipairs(LOG) do
+        local l = lbl(line, 0, Color3.fromRGB(170, 175, 190), 10, false, logBox)
+        l.Size = UDim2.new(1, -8, 0, 14)
+        l.Position = UDim2.fromOffset(4, y)
+        y = y + 14
+    end
+end
+
+function renderAds()
+    clear(adList)
+    local y = 0
+    for _, a in ipairs(ADS) do
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(1, -8, 0, 30)
+        b.Position = UDim2.fromOffset(4, y)
+        b.BackgroundColor3 = Color3.fromRGB(22, 26, 32)
+        b.TextXAlignment = Enum.TextXAlignment.Left
+        b.Font = Enum.Font.Gotham
+        b.TextSize = 10
+        b.TextColor3 = Color3.fromRGB(210, 214, 226)
+        b.Text = ("%s  +%d  (has %d / wants %d)"):format(a.user, a.profit, a.has, a.wants)
+        b.BorderSizePixel = 0
+        b.Parent = adList
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 4)
+        b.MouseButton1Click:Connect(function()
+            local p = Players:FindFirstChild(a.user)
+            if p then sendTrade(p) else log(a.user, "not in server") end
+        end)
+        y = y + 32
+    end
+    if #ADS == 0 then lbl("no profitable ads", 4, Color3.fromRGB(120, 125, 140), 10, false, adList) end
+end
+
+function updateGUI(r)
+    stateL.Text = ("%s | %d items"):format(DBSTATE, (function() local n = 0 for _ in pairs(DB) do n = n + 1 end return n end)())
+    stateL.TextColor3 = DBSTATE == "LIVE" and Color3.fromRGB(90, 199, 122) or DBSTATE == "PARTIAL" and Color3.fromRGB(232, 194, 74) or Color3.fromRGB(242, 85, 90)
+    theirsL.Text = ("THEY: %d"):format(r.their)
+    oursL.Text = ("YOU : %d"):format(r.our)
+    deltaL.Text = ("DELTA: %+d (%.0f%%)"):format(r.delta, r.pct)
+    deltaL.TextColor3 = r.delta > 0 and Color3.fromRGB(90, 199, 122) or r.delta < 0 and Color3.fromRGB(242, 85, 90) or Color3.fromRGB(255, 255, 255)
+    metaL.Text = ("gems %d/%d  unpriced %d  slot %d"):format(r.tg, r.og, r.unknown, S.slot)
+    gainL.Text = ("session: %+d"):format(SESSION.gain)
+    bestL.Text = ("best: %d  deals: %d"):format(SESSION.best, SESSION.count)
+    clear(itemList)
+    local y = 0
+    if r.tg > 0 then
+        local l = lbl(("+ %d gems"):format(r.tg), 0, Color3.fromRGB(232, 194, 74), 10, true, itemList)
+        l.Size = UDim2.new(1, -8, 0, 14)
+        l.Position = UDim2.fromOffset(4, y)
+        y = y + 14
+    end
+    for _, it in ipairs(r.tItems) do
+        local l = lbl(it.unknown and ("? %s x%d"):format(it.name, it.qty) or ("+ %s x%d (%d)"):format(it.name, it.qty, it.value * it.qty), 0,
+            it.unknown and Color3.fromRGB(130, 135, 150) or (it.gem and Color3.fromRGB(232, 194, 74) or Color3.fromRGB(90, 199, 122)), 10, false, itemList)
+        l.Size = UDim2.new(1, -8, 0, 14)
+        l.Position = UDim2.fromOffset(4, y)
+        y = y + 14
+    end
+    for _, it in ipairs(r.oItems) do
+        local l = lbl(("- %s x%d (%d)"):format(it.name, it.qty, it.value * it.qty), 0, Color3.fromRGB(242, 85, 90), 10, false, itemList)
+        l.Size = UDim2.new(1, -8, 0, 14)
+        l.Position = UDim2.fromOffset(4, y)
+        y = y + 14
+    end
+end
+
+function refreshPlayers()
+    clear(playerList)
+    local y = 0
+    for _, e in ipairs(targets()) do
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(1, -8, 0, 16)
+        b.Position = UDim2.fromOffset(4, y)
+        b.BackgroundTransparency = 1
+        b.TextXAlignment = Enum.TextXAlignment.Left
+        b.Font = Enum.Font.Gotham
+        b.TextSize = 10
+        b.TextColor3 = Color3.fromRGB(180, 185, 200)
+        b.Text = ("%s (%dm)"):format(e.plr.Name, math.floor(e.dist))
+        b.Parent = playerList
+        b.MouseButton1Click:Connect(function() sendTrade(e.plr) end)
+        y = y + 16
+    end
+end
+
+onChange.Event:Connect(function() task.spawn(function() updateGUI(evaluate()) end) end)
+task.spawn(function() while true do task.wait(2) refreshPlayers() task.wait(1) updateGUI(evaluate()) end end)
+
+TABS.TRADE.MouseButton1Click:Fire()
+
+task.spawn(function()
+    loadValues(true)
+    log("loaded")
+    if DBSTATE == "LIVE" then task.spawn(loadAds) end
+end)
